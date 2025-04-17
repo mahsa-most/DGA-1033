@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+EV Battery Refurbishment Optimization Scenarios
+- Base Scenario (Without IoT)
+- Enhanced Scenario (With IoT)
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import random
+from mpl_toolkits.mplot3d import Axes3D
+
+# Set random seed for reproducibility
+random.seed(42)
+np.random.seed(42)
+
+# === SIMULATION DATA ===
+def load_sample_data():
+    """Provides sample data for the EV battery refurbishment model"""
+    # Create base parameters for the model
+    data = {
+        # Cost parameters
+        "cost": {
+            # Manufacturing costs
+            'manufacturing_base_cost': 50000,
+            'manufacturing_automation_factor': 0.2,
+            'refurbishment_unit_cost': 30000,
+            'recycling_unit_cost': 20000,
+            'disposal_unit_cost': 10000,
+            'transportation_base_cost': 100.0,
+            'transportation_efficiency_factor': 0.3,
+            'transportation_iot_factor': 0.85,
+            
+            # IoT implementation costs
+            'iot_implementation': 20000.0,
+            'iot_maintenance_factor': 0.15  # Annual maintenance as fraction of implementation
+        },
+        
+        # Emission parameters
+        "emissions": {
+            # Manufacturing emissions
+            'manufacturing_base_emissions': 10000,
+            'manufacturing_automation_factor': 0.15,
+            'refurbishment_unit_emissions': 3000,
+            'recycling_unit_emissions': 5000,
+            'disposal_unit_emissions': 15000,
+            'transportation_base_emissions': 15.0,
+            'transportation_efficiency_factor': 0.25,
+            'transportation_iot_factor': 0.80,
+            
+            # IoT implementation emissions
+            'iot_implementation': 5000.0,
+            'iot_operation_factor': 0.1  # Annual emissions as fraction of implementation
+        },
+        
+        # Acceptance parameters
+        "acceptance": {
+            # Base acceptance factors
+            'base_acceptance_factor': 5000,
+            'quality_automation_factor': 0.2,
+            'trust_collection_factor': 0.15,
+            
+            # IoT-specific improvement factors
+            'lambda_pso': 1.3,  # Prediction accuracy improvement factor
+            'sigma_epso': 1.2,  # Process optimization factor
+        }
+    }
+    
+    return data
+
+# === OBJECTIVE FUNCTIONS ===
+def cost_objective(x, use_iot, data):
+    """Calculate the cost objective value"""
+    # Unpack decision variables
+    refurbish_prop, recycle_prop, automation, transport_eff, collection_rate = x
+    
+    # Base costs
+    manufacturing_cost = data['cost']['manufacturing_base_cost'] * (1 - data['cost']['manufacturing_automation_factor'] * automation)
+    refurbishment_cost = data['cost']['refurbishment_unit_cost'] * refurbish_prop
+    recycling_cost = data['cost']['recycling_unit_cost'] * recycle_prop
+    disposal_cost = data['cost']['disposal_unit_cost'] * (1 - refurbish_prop - recycle_prop)
+    transport_cost = data['cost']['transportation_base_cost'] * 500 * (1 - data['cost']['transportation_efficiency_factor'] * transport_eff)
+    
+    # Calculate total cost
+    if use_iot:
+        # Add IoT implementation and maintenance costs
+        iot_cost = data['cost']['iot_implementation'] + data['cost']['iot_implementation'] * data['cost']['iot_maintenance_factor']
+        # IoT reduces transport costs
+        transport_cost *= data['cost']['transportation_iot_factor']
+        # IoT improves refurbishment efficiency
+        refurbishment_cost *= 0.9
+        
+        total_cost = manufacturing_cost + refurbishment_cost + recycling_cost + disposal_cost + transport_cost + iot_cost
+    else:
+        total_cost = manufacturing_cost + refurbishment_cost + recycling_cost + disposal_cost + transport_cost
+    
+    return total_cost
+
+def emissions_objective(x, use_iot, data):
+    """Calculate the emissions objective value"""
+    # Unpack decision variables
+    refurbish_prop, recycle_prop, automation, transport_eff, collection_rate = x
+    
+    # Base emissions
+    manufacturing_emissions = data['emissions']['manufacturing_base_emissions'] * (1 - data['emissions']['manufacturing_automation_factor'] * automation)
+    refurbishment_emissions = data['emissions']['refurbishment_unit_emissions'] * refurbish_prop
+    recycling_emissions = data['emissions']['recycling_unit_emissions'] * recycle_prop
+    disposal_emissions = data['emissions']['disposal_unit_emissions'] * (1 - refurbish_prop - recycle_prop)
+    transport_emissions = data['emissions']['transportation_base_emissions'] * 500 * (1 - data['emissions']['transportation_efficiency_factor'] * transport_eff)
+    
+    # Calculate total emissions
+    if use_iot:
+        # Add IoT implementation and operation emissions
+        iot_emissions = data['emissions']['iot_implementation'] + data['emissions']['iot_implementation'] * data['emissions']['iot_operation_factor']
+        # IoT reduces transport emissions
+        transport_emissions *= data['emissions']['transportation_iot_factor']
+        # IoT improves battery classification, leading to less disposal
+        disposal_emissions *= 0.85
+        
+        total_emissions = manufacturing_emissions + refurbishment_emissions + recycling_emissions + disposal_emissions + transport_emissions + iot_emissions
+    else:
+        total_emissions = manufacturing_emissions + refurbishment_emissions + recycling_emissions + disposal_emissions + transport_emissions
+    
+    return total_emissions
+
+def acceptance_objective(x, use_iot, data):
+    """Calculate the acceptance objective value (to be maximized)"""
+    # Unpack decision variables
+    refurbish_prop, recycle_prop, automation, transport_eff, collection_rate = x
+    
+    # Base acceptance factors
+    # Higher refurbishment proportion improves acceptance
+    base_acceptance = data['acceptance']['base_acceptance_factor'] * refurbish_prop
+    # Automation improves quality
+    quality_factor = 1.0 + data['acceptance']['quality_automation_factor'] * automation
+    # Higher collection rate increases trust
+    trust_factor = 1.0 + data['acceptance']['trust_collection_factor'] * collection_rate
+    
+    # Calculate total acceptance
+    if use_iot:
+        # IoT improves SoH estimation accuracy
+        lambda_pso = data['acceptance']['lambda_pso']
+        # IoT improves refurbishment process
+        sigma_epso = data['acceptance']['sigma_epso']
+        
+        # Enhanced acceptance due to IoT
+        acceptance = base_acceptance * quality_factor * trust_factor * (1 + lambda_pso * sigma_epso * 0.1)
+    else:
+        acceptance = base_acceptance * quality_factor * trust_factor
+    
+    return acceptance
+
+# === EVALUATE SOLUTION ===
+def evaluate_solution(x, use_iot, data):
+    """Evaluate a solution for all three objectives"""
+    cost = cost_objective(x, use_iot, data)
+    emissions = emissions_objective(x, use_iot, data)
+    acceptance = acceptance_objective(x, use_iot, data)
+    
+    # Return as a tuple (all to be minimized)
+    return (cost, emissions, -acceptance)  # Negate acceptance for minimization
+
+# === CONSTRAINTS HANDLING ===
+def check_constraints(x):
+    """Check if a solution satisfies all constraints"""
+    refurbish_prop, recycle_prop, automation, transport_eff, collection_rate = x
+    
+    # Constraint 1: Sum of refurbish and recycle proportions must be <= 1
+    if refurbish_prop + recycle_prop > 1:
+        return False
+    
+    # Constraint 2: All variables must be between 0 and 1
+    if any(var < 0 or var > 1 for var in x):
+        return False
+    
+    # Constraint 3: Minimum refurbishment proportion
+    if refurbish_prop < 0.3:
+        return False
+    
+    # All constraints satisfied
+    return True
+
+# === SCENARIO SIMULATION ===
+def generate_scenario_solutions(use_iot, data, n_solutions=100):
+    """Generate a set of valid solutions for each scenario"""
+    solutions = []
+    for _ in range(n_solutions):
+        # Create a random solution
+        while True:
+            refurbish_prop = random.uniform(0.3, 1.0)  # At least 30% refurbishment
+            recycle_prop = random.uniform(0.0, 0.7)    # Leave room for refurbishment
+            
+            # Ensure refurbish + recycle <= 1
+            if refurbish_prop + recycle_prop > 1:
+                recycle_prop = max(0, 1 - refurbish_prop)
+                
+            automation = random.uniform(0.0, 1.0)
+            transport_eff = random.uniform(0.0, 1.0)
+            collection_rate = random.uniform(0.0, 1.0)
+            
+            solution = [refurbish_prop, recycle_prop, automation, transport_eff, collection_rate]
+            
+            # Check constraints
+            if check_constraints(solution):
+                # Evaluate solution
+                fitness = evaluate_solution(solution, use_iot, data)
+                solutions.append((solution, fitness))
+                break
+    
+    return solutions
+
+def get_pareto_front(solutions):
+    """Extract non-dominated solutions (Pareto front)"""
+    pareto_front = []
+    
+    for i, (sol_i, fitness_i) in enumerate(solutions):
+        is_dominated = False
+        for j, (sol_j, fitness_j) in enumerate(solutions):
+            if i != j:
+                # Check if sol_j dominates sol_i
+                dominates = True
+                for k in range(3):
+                    if fitness_j[k] > fitness_i[k]:  # Assuming minimization
+                        dominates = False
+                        break
+                
+                if dominates and any(fitness_j[k] < fitness_i[k] for k in range(3)):
+                    is_dominated = True
+                    break
+        
+        if not is_dominated:
+            pareto_front.append((sol_i, fitness_i))
+    
+    return pareto_front
+
+def run_scenario_comparison():
+    """Run both scenarios and compare results"""
+    data = load_sample_data()
+    
+    # Generate solutions for both scenarios
+    print("Generating solutions for Base Scenario (Without IoT)...")
+    solutions_without_iot = generate_scenario_solutions(use_iot=False, data=data)
+    
+    print("Generating solutions for Enhanced Scenario (With IoT)...")
+    solutions_with_iot = generate_scenario_solutions(use_iot=True, data=data)
+    
+    # Extract Pareto fronts
+    pareto_without_iot = get_pareto_front(solutions_without_iot)
+    pareto_with_iot = get_pareto_front(solutions_with_iot)
+    
+    print(f"Found {len(pareto_without_iot)} Pareto-optimal solutions without IoT")
+    print(f"Found {len(pareto_with_iot)} Pareto-optimal solutions with IoT")
+    
+    # Find best solutions for each objective
+    # Without IoT
+    min_cost_without_iot = min(pareto_without_iot, key=lambda x: x[1][0])
+    min_emissions_without_iot = min(pareto_without_iot, key=lambda x: x[1][1])
+    max_acceptance_without_iot = min(pareto_without_iot, key=lambda x: x[1][2])  # Remember it's negated
+    
+    # With IoT
+    min_cost_with_iot = min(pareto_with_iot, key=lambda x: x[1][0])
+    min_emissions_with_iot = min(pareto_with_iot, key=lambda x: x[1][1])
+    max_acceptance_with_iot = min(pareto_with_iot, key=lambda x: x[1][2])  # Remember it's negated
+    
+    # Print results
+    print("\nBase Scenario (Without IoT):")
+    print("=" * 50)
+    print(f"Best Cost Solution: {min_cost_without_iot[0]}")
+    print(f"  Cost: {min_cost_without_iot[1][0]:.2f}")
+    print(f"  Emissions: {min_cost_without_iot[1][1]:.2f}")
+    print(f"  Acceptance: {-min_cost_without_iot[1][2]:.2f}")
+    
+    print(f"\nBest Emissions Solution: {min_emissions_without_iot[0]}")
+    print(f"  Cost: {min_emissions_without_iot[1][0]:.2f}")
+    print(f"  Emissions: {min_emissions_without_iot[1][1]:.2f}")
+    print(f"  Acceptance: {-min_emissions_without_iot[1][2]:.2f}")
+    
+    print(f"\nBest Acceptance Solution: {max_acceptance_without_iot[0]}")
+    print(f"  Cost: {max_acceptance_without_iot[1][0]:.2f}")
+    print(f"  Emissions: {max_acceptance_without_iot[1][1]:.2f}")
+    print(f"  Acceptance: {-max_acceptance_without_iot[1][2]:.2f}")
+    
+    print("\nEnhanced Scenario (With IoT):")
+    print("=" * 50)
+    print(f"Best Cost Solution: {min_cost_with_iot[0]}")
+    print(f"  Cost: {min_cost_with_iot[1][0]:.2f}")
+    print(f"  Emissions: {min_cost_with_iot[1][1]:.2f}")
+    print(f"  Acceptance: {-min_cost_with_iot[1][2]:.2f}")
+    
+    print(f"\nBest Emissions Solution: {min_emissions_with_iot[0]}")
+    print(f"  Cost: {min_emissions_with_iot[1][0]:.2f}")
+    print(f"  Emissions: {min_emissions_with_iot[1][1]:.2f}")
+    print(f"  Acceptance: {-min_emissions_with_iot[1][2]:.2f}")
+    
+    print(f"\nBest Acceptance Solution: {max_acceptance_with_iot[0]}")
+    print(f"  Cost: {max_acceptance_with_iot[1][0]:.2f}")
+    print(f"  Emissions: {max_acceptance_with_iot[1][1]:.2f}")
+    print(f"  Acceptance: {-max_acceptance_with_iot[1][2]:.2f}")
+    
+    # Calculate improvements
+    cost_improvement = (min_cost_without_iot[1][0] - min_cost_with_iot[1][0]) / min_cost_without_iot[1][0] * 100
+    emissions_improvement = (min_emissions_without_iot[1][1] - min_emissions_with_iot[1][1]) / min_emissions_without_iot[1][1] * 100
+    acceptance_improvement = (-max_acceptance_with_iot[1][2] - (-max_acceptance_without_iot[1][2])) / (-max_acceptance_without_iot[1][2]) * 100
+    
+    print("\nImprovements with IoT:")
+    print("=" * 50)
+    print(f"Cost Improvement: {cost_improvement:.2f}%")
+    print(f"Emissions Improvement: {emissions_improvement:.2f}%")
+    print(f"Acceptance Improvement: {acceptance_improvement:.2f}%")
+    
+    # Plot comparison
+    plot_scenario_comparison(pareto_without_iot, pareto_with_iot)
+    
+    return {
+        'without_iot': pareto_without_iot,
+        'with_iot': pareto_with_iot,
+        'improvement': {
+            'cost': cost_improvement,
+            'emissions': emissions_improvement,
+            'acceptance': acceptance_improvement
+        }
+    }
+
+def plot_scenario_comparison(pareto_without_iot, pareto_with_iot):
+    """Plot the Pareto fronts comparing scenarios with and without IoT"""
+    # Extract objective values
+    cost_without_iot = [sol[1][0] for sol in pareto_without_iot]
+    emissions_without_iot = [sol[1][1] for sol in pareto_without_iot]
+    acceptance_without_iot = [-sol[1][2] for sol in pareto_without_iot]  # Convert back to positive
+    
+    cost_with_iot = [sol[1][0] for sol in pareto_with_iot]
+    emissions_with_iot = [sol[1][1] for sol in pareto_with_iot]
+    acceptance_with_iot = [-sol[1][2] for sol in pareto_with_iot]  # Convert back to positive
+    
+    # Create subplot for Cost vs. Emissions
+    plt.figure(figsize=(15, 5))
+    
+    plt.subplot(1, 3, 1)
+    plt.scatter(cost_without_iot, emissions_without_iot, color='blue', label='Without IoT')
+    plt.scatter(cost_with_iot, emissions_with_iot, color='red', label='With IoT')
+    plt.xlabel('Cost')
+    plt.ylabel('Emissions')
+    plt.title('Cost vs. Emissions')
+    plt.legend()
+    plt.grid(True)
+    
+    # Create subplot for Cost vs. Acceptance
+    plt.subplot(1, 3, 2)
+    plt.scatter(cost_without_iot, acceptance_without_iot, color='blue', label='Without IoT')
+    plt.scatter(cost_with_iot, acceptance_with_iot, color='red', label='With IoT')
+    plt.xlabel('Cost')
+    plt.ylabel('Acceptance')
+    plt.title('Cost vs. Acceptance')
+    plt.legend()
+    plt.grid(True)
+    
+    # Create subplot for Emissions vs. Acceptance
+    plt.subplot(1, 3, 3)
+    plt.scatter(emissions_without_iot, acceptance_without_iot, color='blue', label='Without IoT')
+    plt.scatter(emissions_with_iot, acceptance_with_iot, color='red', label='With IoT')
+    plt.xlabel('Emissions')
+    plt.ylabel('Acceptance')
+    plt.title('Emissions vs. Acceptance')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('pareto_front_comparison.png')
+    plt.show()
+    
+    # Create 3D plot
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Plot points
+    ax.scatter(cost_without_iot, emissions_without_iot, acceptance_without_iot, 
+               color='blue', label='Without IoT')
+    ax.scatter(cost_with_iot, emissions_with_iot, acceptance_with_iot, 
+               color='red', label='With IoT')
+    
+    # Set labels
+    ax.set_xlabel('Cost')
+    ax.set_ylabel('Emissions')
+    ax.set_zlabel('Acceptance')
+    ax.set_title('3D Pareto Front Comparison')
+    
+    plt.legend()
+    plt.savefig('pareto_front_3d.png')
+    plt.show()
+
+# Sample test case for a single solution
+def test_single_solution():
+    """Test the objective functions for a sample solution"""
+    data = load_sample_data()
+    
+    # Sample solution: [refurbish_prop, recycle_prop, automation, transport_eff, collection_rate]
+    solution = [0.6, 0.3, 0.8, 0.7, 0.9]
+    
+    # Evaluate without IoT
+    cost_no_iot = cost_objective(solution, False, data)
+    emissions_no_iot = emissions_objective(solution, False, data)
+    acceptance_no_iot = acceptance_objective(solution, False, data)
+    
+    # Evaluate with IoT
+    cost_with_iot = cost_objective(solution, True, data)
+    emissions_with_iot = emissions_objective(solution, True, data)
+    acceptance_with_iot = acceptance_objective(solution, True, data)
+    
+    print("Single Solution Comparison:")
+    print("=" * 50)
+    print(f"Solution: {solution}")
+    print("\nBase Scenario (Without IoT):")
+    print(f"  Cost: {cost_no_iot:.2f}")
+    print(f"  Emissions: {emissions_no_iot:.2f}")
+    print(f"  Acceptance: {acceptance_no_iot:.2f}")
+    
+    print("\nEnhanced Scenario (With IoT):")
+    print(f"  Cost: {cost_with_iot:.2f}")
+    print(f"  Emissions: {emissions_with_iot:.2f}")
+    print(f"  Acceptance: {acceptance_with_iot:.2f}")
+    
+    print("\nImpact of IoT:")
+    print(f"  Cost: {(cost_with_iot - cost_no_iot) / cost_no_iot * 100:.2f}%")
+    print(f"  Emissions: {(emissions_with_iot - emissions_no_iot) / emissions_no_iot * 100:.2f}%")
+    print(f"  Acceptance: {(acceptance_with_iot - acceptance_no_iot) / acceptance_no_iot * 100:.2f}%")
+
+if __name__ == "__main__":
+    # Run single solution test
+    test_single_solution()
+    
+    # Run full scenario comparison
+    results = run_scenario_comparison()
