@@ -1,0 +1,1788 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Apr  1 17:43:37 2025
+
+@author: mahsamostafaeinejad
+"""
+
+"""
+Complete MOEA/D Implementation for EV Battery Refurbishment Optimization
+No external evolutionary algorithm libraries required
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import random
+import time
+from mpl_toolkits.mplot3d import Axes3D
+
+# === SIMULATION DATA ===
+
+def load_sample_data():
+    """Provides sample data for the EV battery refurbishment model"""
+    # Create base parameters for the model
+    data = {
+        # Cost parameters
+        "cost": {
+            # Manufacturing costs
+            'manufacturing_base_cost': 50000,
+            'manufacturing_automation_factor': 0.2,
+            'refurbishment_unit_cost': 30000,
+            'recycling_unit_cost': 20000,
+            'disposal_unit_cost': 10000,
+            'transportation_base_cost': 100.0,
+            'transportation_efficiency_factor': 0.3,
+            'transportation_iot_factor': 0.85,
+            
+            # IoT implementation costs
+            'iot_implementation': 20000.0,
+            'iot_maintenance_factor': 0.15  # Annual maintenance as fraction of implementation
+        },
+        
+        # Emission parameters
+        "emissions": {
+            # Manufacturing emissions
+            'manufacturing_base_emissions': 10000,
+            'manufacturing_automation_factor': 0.15,
+            'refurbishment_unit_emissions': 3000,
+            'recycling_unit_emissions': 5000,
+            'disposal_unit_emissions': 15000,
+            'transportation_base_emissions': 15.0,
+            'transportation_efficiency_factor': 0.25,
+            'transportation_iot_factor': 0.80,
+            
+            # IoT implementation emissions
+            'iot_implementation': 5000.0,
+            'iot_operation_factor': 0.1  # Annual emissions as fraction of implementation
+        },
+        
+        # Acceptance parameters
+        "acceptance": {
+            # Base acceptance factors
+            'base_acceptance_factor': 5000,
+            'quality_automation_factor': 0.2,
+            'trust_collection_factor': 0.15,
+            
+            # IoT-specific improvement factors
+            'lambda_pso': 1.3,  # Prediction accuracy improvement factor
+            'sigma_epso': 1.2,  # Process optimization factor
+        }
+    }
+    
+    return data
+
+# === OBJECTIVE FUNCTIONS ===
+
+def cost_objective(x, use_iot, data):
+    """Calculate the cost objective value"""
+    # Unpack decision variables
+    refurbish_prop, recycle_prop, automation, transport_eff, collection_rate = x
+    
+    # Base costs
+    manufacturing_cost = data['cost']['manufacturing_base_cost'] * (1 - data['cost']['manufacturing_automation_factor'] * automation)
+    refurbishment_cost = data['cost']['refurbishment_unit_cost'] * refurbish_prop
+    recycling_cost = data['cost']['recycling_unit_cost'] * recycle_prop
+    disposal_cost = data['cost']['disposal_unit_cost'] * (1 - refurbish_prop - recycle_prop)
+    transport_cost = data['cost']['transportation_base_cost'] * 500 * (1 - data['cost']['transportation_efficiency_factor'] * transport_eff)
+    
+    # Calculate total cost
+    if use_iot:
+        # Add IoT implementation and maintenance costs
+        iot_cost = data['cost']['iot_implementation'] + data['cost']['iot_implementation'] * data['cost']['iot_maintenance_factor']
+        # IoT reduces transport costs
+        transport_cost *= data['cost']['transportation_iot_factor']
+        # IoT improves refurbishment efficiency
+        refurbishment_cost *= 0.9
+        
+        total_cost = manufacturing_cost + refurbishment_cost + recycling_cost + disposal_cost + transport_cost + iot_cost
+    else:
+        total_cost = manufacturing_cost + refurbishment_cost + recycling_cost + disposal_cost + transport_cost
+    
+    return total_cost
+
+def emissions_objective(x, use_iot, data):
+    """Calculate the emissions objective value"""
+    # Unpack decision variables
+    refurbish_prop, recycle_prop, automation, transport_eff, collection_rate = x
+    
+    # Base emissions
+    manufacturing_emissions = data['emissions']['manufacturing_base_emissions'] * (1 - data['emissions']['manufacturing_automation_factor'] * automation)
+    refurbishment_emissions = data['emissions']['refurbishment_unit_emissions'] * refurbish_prop
+    recycling_emissions = data['emissions']['recycling_unit_emissions'] * recycle_prop
+    disposal_emissions = data['emissions']['disposal_unit_emissions'] * (1 - refurbish_prop - recycle_prop)
+    transport_emissions = data['emissions']['transportation_base_emissions'] * 500 * (1 - data['emissions']['transportation_efficiency_factor'] * transport_eff)
+    
+    # Calculate total emissions
+    if use_iot:
+        # Add IoT implementation and operation emissions
+        iot_emissions = data['emissions']['iot_implementation'] + data['emissions']['iot_implementation'] * data['emissions']['iot_operation_factor']
+        # IoT reduces transport emissions
+        transport_emissions *= data['emissions']['transportation_iot_factor']
+        # IoT improves battery classification, leading to less disposal
+        disposal_emissions *= 0.85
+        
+        total_emissions = manufacturing_emissions + refurbishment_emissions + recycling_emissions + disposal_emissions + transport_emissions + iot_emissions
+    else:
+        total_emissions = manufacturing_emissions + refurbishment_emissions + recycling_emissions + disposal_emissions + transport_emissions
+    
+    return total_emissions
+
+def acceptance_objective(x, use_iot, data):
+    """Calculate the acceptance objective value (to be maximized)"""
+    # Unpack decision variables
+    refurbish_prop, recycle_prop, automation, transport_eff, collection_rate = x
+    
+    # Base acceptance factors
+    # Higher refurbishment proportion improves acceptance
+    base_acceptance = data['acceptance']['base_acceptance_factor'] * refurbish_prop
+    # Automation improves quality
+    quality_factor = 1.0 + data['acceptance']['quality_automation_factor'] * automation
+    # Higher collection rate increases trust
+    trust_factor = 1.0 + data['acceptance']['trust_collection_factor'] * collection_rate
+    
+    # Calculate total acceptance
+    if use_iot:
+        # IoT improves SoH estimation accuracy
+        lambda_pso = data['acceptance']['lambda_pso']
+        # IoT improves refurbishment process
+        sigma_epso = data['acceptance']['sigma_epso']
+        
+        # Enhanced acceptance due to IoT
+        acceptance = base_acceptance * quality_factor * trust_factor * (1 + lambda_pso * sigma_epso * 0.1)
+    else:
+        acceptance = base_acceptance * quality_factor * trust_factor
+    
+    return acceptance
+
+# Define evaluation function for both scenarios
+def evaluate_solution(x, use_iot, data):
+    """Evaluate a solution for all three objectives"""
+    cost = cost_objective(x, use_iot, data)
+    emissions = emissions_objective(x, use_iot, data)
+    acceptance = acceptance_objective(x, use_iot, data)
+    
+    # Return as a tuple (all to be minimized)
+    return (cost, emissions, -acceptance)  # Negate acceptance for minimization
+
+# === CONSTRAINTS HANDLING ===
+
+def check_constraints(x):
+    """Check if a solution satisfies all constraints"""
+    refurbish_prop, recycle_prop, automation, transport_eff, collection_rate = x
+    
+    # Constraint 1: Sum of refurbish and recycle proportions must be <= 1
+    if refurbish_prop + recycle_prop > 1:
+        return False
+    
+    # Constraint 2: All variables must be between 0 and 1
+    if any(var < 0 or var > 1 for var in x):
+        return False
+    
+    # Constraint 3: Minimum refurbishment proportion
+    if refurbish_prop < 0.3:
+        return False
+    
+    # All constraints satisfied
+    return True
+
+# === MOEA/D ALGORITHM ===
+
+class Individual:
+    """Class to represent an individual in the population"""
+    
+    def __init__(self, genes, use_iot, data):
+        self.genes = genes
+        self.fitness = None
+        self.evaluate(use_iot, data)
+    
+    def evaluate(self, use_iot, data):
+        """Evaluate the individual and set fitness values"""
+        if check_constraints(self.genes):
+            self.fitness = evaluate_solution(self.genes, use_iot, data)
+        else:
+            # Penalize infeasible solutions
+            self.fitness = (float('inf'), float('inf'), float('-inf'))
+
+def create_random_individual(use_iot, data):
+    """Create a random individual within constraints"""
+    while True:
+        # Generate random values
+        refurbish_prop = random.uniform(0.3, 1.0)  # At least 30% refurbishment
+        recycle_prop = random.uniform(0.0, 0.7)    # Leave room for refurbishment
+        
+        # Ensure refurbish + recycle <= 1
+        if refurbish_prop + recycle_prop > 1:
+            recycle_prop = max(0, 1 - refurbish_prop)
+            
+        automation = random.uniform(0.0, 1.0)
+        transport_eff = random.uniform(0.0, 1.0)
+        collection_rate = random.uniform(0.0, 1.0)
+        
+        genes = [refurbish_prop, recycle_prop, automation, transport_eff, collection_rate]
+        
+        # Check constraints
+        if check_constraints(genes):
+            return Individual(genes, use_iot, data)
+
+def initialize_population(n_weights, use_iot, data):
+    """Initialize a random population"""
+    return [create_random_individual(use_iot, data) for _ in range(n_weights)]
+
+def generate_weight_vectors(n_divisions):
+    """Generate uniformly distributed weight vectors"""
+    weights = []
+    
+    # Generate all possible weight combinations
+    for i in range(n_divisions + 1):
+        for j in range(n_divisions + 1 - i):
+            k = n_divisions - i - j
+            if k >= 0:
+                # Normalize weights
+                weight = [i / n_divisions, j / n_divisions, k / n_divisions]
+                weights.append(weight)
+    
+    return weights
+
+def calculate_neighborhood(weights, T):
+    """Calculate neighborhood for each weight vector"""
+    n_weights = len(weights)
+    neighborhoods = []
+    
+    for i in range(n_weights):
+        # Calculate distance to all other weight vectors
+        distances = []
+        for j in range(n_weights):
+            # Euclidean distance
+            dist = np.sqrt(sum((weights[i][k] - weights[j][k]) ** 2 for k in range(3)))
+            distances.append((j, dist))
+        
+        # Sort by distance and select T closest
+        distances.sort(key=lambda x: x[1])
+        neighborhoods.append([idx for idx, _ in distances[:T]])
+    
+    return neighborhoods
+
+def scalarize_tchebycheff(fitness, weight, ideal_point):
+    """Scalarize fitness values using Tchebycheff approach"""
+    max_val = float('-inf')
+    
+    for i in range(3):
+        # For cost and emissions (minimize)
+        if i < 2:
+            val = weight[i] * abs(fitness[i] - ideal_point[i])
+        # For acceptance (maximize, but negated)
+        else:
+            val = weight[i] * abs(fitness[i] - ideal_point[i])
+        
+        if val > max_val:
+            max_val = val
+    
+    return max_val
+
+def crossover(parent1, parent2, eta=20, p_crossover=0.9):
+    """Simulated binary crossover (SBX) operator"""
+    if random.random() > p_crossover:
+        return parent1.genes[:], parent2.genes[:]
+    
+    child1 = []
+    child2 = []
+    
+    for i in range(len(parent1.genes)):
+        # SBX crossover
+        y1 = parent1.genes[i]
+        y2 = parent2.genes[i]
+        
+        if abs(y1 - y2) > 1e-10:  # Avoid division by zero
+            if y1 < y2:
+                y_low, y_high = y1, y2
+            else:
+                y_low, y_high = y2, y1
+            
+            rand = random.random()
+            beta = 1.0 + 2.0 * (y_low - 0.0) / (y_high - y_low)
+            alpha = 2.0 - beta ** -(eta + 1)
+            
+            if rand <= 1.0 / alpha:
+                beta_q = (rand * alpha) ** (1.0 / (eta + 1))
+            else:
+                beta_q = (1.0 / (2.0 - rand * alpha)) ** (1.0 / (eta + 1))
+            
+            c1 = 0.5 * ((y_low + y_high) - beta_q * (y_high - y_low))
+            c2 = 0.5 * ((y_low + y_high) + beta_q * (y_high - y_low))
+            
+            # Ensure constraints are met
+            c1 = max(0.0, min(c1, 1.0))
+            c2 = max(0.0, min(c2, 1.0))
+        else:
+            c1 = y1
+            c2 = y2
+        
+        child1.append(c1)
+        child2.append(c2)
+    
+    return child1, child2
+
+def mutation(genes, eta=20, p_mutation=0.2):
+    """Polynomial mutation operator"""
+    mutated_genes = genes[:]
+    
+    for i in range(len(genes)):
+        if random.random() <= p_mutation:
+            y = genes[i]
+            delta_1 = (y - 0.0) / (1.0 - 0.0)
+            delta_2 = (1.0 - y) / (1.0 - 0.0)
+            
+            rand = random.random()
+            mut_pow = 1.0 / (eta + 1.0)
+            
+            if rand < 0.5:
+                xy = 1.0 - delta_1
+                val = 2.0 * rand + (1.0 - 2.0 * rand) * (xy ** (eta + 1.0))
+                delta_q = val ** mut_pow - 1.0
+            else:
+                xy = 1.0 - delta_2
+                val = 2.0 * (1.0 - rand) + 2.0 * (rand - 0.5) * (xy ** (eta + 1.0))
+                delta_q = 1.0 - val ** mut_pow
+            
+            y += delta_q * (1.0 - 0.0)
+            y = max(0.0, min(y, 1.0))  # Ensure constraints are met
+            
+            mutated_genes[i] = y
+    
+    # Ensure refurbish_prop + recycle_prop <= 1
+    if mutated_genes[0] + mutated_genes[1] > 1:
+        mutated_genes[1] = max(0, 1 - mutated_genes[0])
+    
+    return mutated_genes
+
+def dominates(ind1, ind2):
+    """Check if individual 1 dominates individual 2"""
+    better_in_one = False
+    for i in range(len(ind1.fitness)):
+        if ind1.fitness[i] > ind2.fitness[i]:
+            return False
+        if ind1.fitness[i] < ind2.fitness[i]:
+            better_in_one = True
+    
+    return better_in_one
+
+def update_EP(individual, EP):
+    """Update external population with new individual"""
+    # Check if individual is dominated by any solution in EP
+    dominated = False
+    i = 0
+    while i < len(EP):
+        if dominates(EP[i], individual):
+            dominated = True
+            break
+        elif dominates(individual, EP[i]):
+            # Remove dominated solution
+            EP.pop(i)
+        else:
+            i += 1
+    
+    # Add individual to EP if not dominated
+    if not dominated:
+        EP.append(individual)
+
+def moead(n_divisions, n_gen, T, use_iot, data):
+    """MOEA/D algorithm implementation"""
+    # Generate weight vectors
+    weights = generate_weight_vectors(n_divisions)
+    n_weights = len(weights)
+    
+    print(f"Generated {n_weights} weight vectors")
+    
+    # Calculate neighborhood
+    neighborhoods = calculate_neighborhood(weights, T)
+    
+    # Initialize population
+    population = initialize_population(n_weights, use_iot, data)
+    
+    # Initialize ideal point
+    ideal_point = [float('inf'), float('inf'), float('-inf')]
+    for ind in population:
+        for i in range(3):
+            if i < 2:  # Minimize cost and emissions
+                ideal_point[i] = min(ideal_point[i], ind.fitness[i])
+            else:  # Maximize acceptance (negated)
+                ideal_point[i] = min(ideal_point[i], ind.fitness[i])
+    
+    # External population (for non-dominated solutions)
+    EP = []
+    
+    # Add initial non-dominated solutions to EP
+    for ind in population:
+        update_EP(ind, EP)
+    
+    # Main loop
+    for gen in range(n_gen):
+        if gen % 10 == 0:
+            print(f"Generation {gen}/{n_gen}")
+        
+        # For each subproblem
+        for i in range(n_weights):
+            # Select parents from neighborhood
+            neighbor_indices = neighborhoods[i]
+            if len(neighbor_indices) >= 2:
+                # Select two parents randomly
+                parent_indices = random.sample(neighbor_indices, 2)
+                parent1 = population[parent_indices[0]]
+                parent2 = population[parent_indices[1]]
+            else:
+                # Not enough neighbors, select from whole population
+                parent1 = random.choice(population)
+                parent2 = random.choice(population)
+            
+            # Generate offspring
+            child1_genes, child2_genes = crossover(parent1, parent2)
+            child1_genes = mutation(child1_genes)
+            
+            # Create and evaluate offspring
+            child = Individual(child1_genes, use_iot, data)
+            
+            # Update ideal point
+            for j in range(3):
+                if j < 2:  # Minimize cost and emissions
+                    ideal_point[j] = min(ideal_point[j], child.fitness[j])
+                else:  # Maximize acceptance (negated)
+                    ideal_point[j] = min(ideal_point[j], child.fitness[j])
+            
+            # Update neighborhood solutions
+            for idx in neighbor_indices:
+                # Calculate scalarized values
+                old_value = scalarize_tchebycheff(population[idx].fitness, weights[idx], ideal_point)
+                new_value = scalarize_tchebycheff(child.fitness, weights[idx], ideal_point)
+                
+                # Update if new solution is better
+                if new_value < old_value:
+                    population[idx] = child
+            
+            # Update external population
+            update_EP(child, EP)
+    
+    return EP
+
+# === ANALYSIS FUNCTIONS ===
+
+def plot_pareto_front(pop_without_iot, pop_with_iot):
+    """Plot the Pareto front comparing scenarios with and without IoT"""
+    # Extract objective values
+    cost_without_iot = [ind.fitness[0] for ind in pop_without_iot]
+    emissions_without_iot = [ind.fitness[1] for ind in pop_without_iot]
+    acceptance_without_iot = [-ind.fitness[2] for ind in pop_without_iot]  # Convert back to positive
+    
+    cost_with_iot = [ind.fitness[0] for ind in pop_with_iot]
+    emissions_with_iot = [ind.fitness[1] for ind in pop_with_iot]
+    acceptance_with_iot = [-ind.fitness[2] for ind in pop_with_iot]  # Convert back to positive
+    
+    # Create subplot for Cost vs. Emissions
+    plt.figure(figsize=(15, 5))
+    
+    plt.subplot(1, 3, 1)
+    plt.scatter(cost_without_iot, emissions_without_iot, color='blue', label='Without IoT')
+    plt.scatter(cost_with_iot, emissions_with_iot, color='red', label='With IoT')
+    plt.xlabel('Cost')
+    plt.ylabel('Emissions')
+    plt.title('Cost vs. Emissions')
+    plt.legend()
+    plt.grid(True)
+    
+    # Create subplot for Cost vs. Acceptance
+    plt.subplot(1, 3, 2)
+    plt.scatter(cost_without_iot, acceptance_without_iot, color='blue', label='Without IoT')
+    plt.scatter(cost_with_iot, acceptance_with_iot, color='red', label='With IoT')
+    plt.xlabel('Cost')
+    plt.ylabel('Acceptance')
+    plt.title('Cost vs. Acceptance')
+    plt.legend()
+    plt.grid(True)
+    
+    # Create subplot for Emissions vs. Acceptance
+    plt.subplot(1, 3, 3)
+    plt.scatter(emissions_without_iot, acceptance_without_iot, color='blue', label='Without IoT')
+    plt.scatter(emissions_with_iot, acceptance_with_iot, color='red', label='With IoT')
+    plt.xlabel('Emissions')
+    plt.ylabel('Acceptance')
+    plt.title('Emissions vs. Acceptance')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('pareto_front_comparison_moead_without_deap.png')
+    plt.show()
+    
+    # Create 3D plot
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Plot points
+    ax.scatter(cost_without_iot, emissions_without_iot, acceptance_without_iot, 
+               color='blue', label='Without IoT')
+    ax.scatter(cost_with_iot, emissions_with_iot, acceptance_with_iot, 
+               color='red', label='With IoT')
+    
+    # Set labels
+    ax.set_xlabel('Cost')
+    ax.set_ylabel('Emissions')
+    ax.set_zlabel('Acceptance')
+    ax.set_title('3D Pareto Front Comparison')
+    
+    plt.legend()
+    plt.savefig('pareto_front_3d_moead_without_deap.png')
+    plt.show()
+
+def analyze_solutions(pop_without_iot, pop_with_iot, data):
+    """Analyze and compare the best solutions from both scenarios"""
+    # Find the best solution for each objective
+    # Without IoT
+    min_cost_idx = np.argmin([ind.fitness[0] for ind in pop_without_iot])
+    min_emissions_idx = np.argmin([ind.fitness[1] for ind in pop_without_iot])
+    max_acceptance_idx = np.argmax([ind.fitness[2] for ind in pop_without_iot])
+    
+    best_cost_without_iot = pop_without_iot[min_cost_idx]
+    best_emissions_without_iot = pop_without_iot[min_emissions_idx]
+    best_acceptance_without_iot = pop_without_iot[max_acceptance_idx]
+    
+    # With IoT
+    min_cost_idx = np.argmin([ind.fitness[0] for ind in pop_with_iot])
+    min_emissions_idx = np.argmin([ind.fitness[1] for ind in pop_with_iot])
+    max_acceptance_idx = np.argmax([ind.fitness[2] for ind in pop_with_iot])
+    
+    best_cost_with_iot = pop_with_iot[min_cost_idx]
+    best_emissions_with_iot = pop_with_iot[min_emissions_idx]
+    best_acceptance_with_iot = pop_with_iot[max_acceptance_idx]
+    
+    # Print results
+    print("\nBest Solutions Without IoT:")
+    print("---------------------------")
+    print(f"Best Cost Solution: {best_cost_without_iot.genes}")
+    print(f"  Cost: {best_cost_without_iot.fitness[0]:.2f}")
+    print(f"  Emissions: {best_cost_without_iot.fitness[1]:.2f}")
+    print(f"  Acceptance: {-best_cost_without_iot.fitness[2]:.2f}")
+    
+    print(f"\nBest Emissions Solution: {best_emissions_without_iot.genes}")
+    print(f"  Cost: {best_emissions_without_iot.fitness[0]:.2f}")
+    print(f"  Emissions: {best_emissions_without_iot.fitness[1]:.2f}")
+    print(f"  Acceptance: {-best_emissions_without_iot.fitness[2]:.2f}")
+    
+    print(f"\nBest Acceptance Solution: {best_acceptance_without_iot.genes}")
+    print(f"  Cost: {best_acceptance_without_iot.fitness[0]:.2f}")
+    print(f"  Emissions: {best_acceptance_without_iot.fitness[1]:.2f}")
+    print(f"  Acceptance: {-best_acceptance_without_iot.fitness[2]:.2f}")
+    
+    print("\nBest Solutions With IoT:")
+    print("-----------------------")
+    print(f"Best Cost Solution: {best_cost_with_iot.genes}")
+    print(f"  Cost: {best_cost_with_iot.fitness[0]:.2f}")
+    print(f"  Emissions: {best_cost_with_iot.fitness[1]:.2f}")
+    print(f"  Acceptance: {-best_cost_with_iot.fitness[2]:.2f}")
+    
+    print(f"\nBest Emissions Solution: {best_emissions_with_iot.genes}")
+    print(f"  Cost: {best_emissions_with_iot.fitness[0]:.2f}")
+    print(f"  Emissions: {best_emissions_with_iot.fitness[1]:.2f}")
+    print(f"  Acceptance: {-best_emissions_with_iot.fitness[2]:.2f}")
+    
+    print(f"\nBest Acceptance Solution: {best_acceptance_with_iot.genes}")
+    print(f"  Cost: {best_acceptance_with_iot.fitness[0]:.2f}")
+    print(f"  Emissions: {best_acceptance_with_iot.fitness[1]:.2f}")
+    print(f"  Acceptance: {-best_acceptance_with_iot.fitness[2]:.2f}")
+    
+    # Compare improvements with IoT
+    print("\nImprovements with IoT:")
+    print("---------------------")
+    
+    cost_improvement = (best_cost_without_iot.fitness[0] - best_cost_with_iot.fitness[0]) / best_cost_without_iot.fitness[0] * 100
+    emissions_improvement = (best_emissions_without_iot.fitness[1] - best_emissions_with_iot.fitness[1]) / best_emissions_without_iot.fitness[1] * 100
+    acceptance_improvement = (-best_acceptance_with_iot.fitness[2] - (-best_acceptance_without_iot.fitness[2])) / (-best_acceptance_without_iot.fitness[2]) * 100
+    
+    print(f"Cost Improvement: {cost_improvement:.2f}%")
+    print(f"Emissions Improvement: {emissions_improvement:.2f}%")
+    print(f"Acceptance Improvement: {acceptance_improvement:.2f}%")
+
+# === MAIN FUNCTION ===
+
+def main():
+    """Main function to run the MOEA/D optimization for both scenarios"""
+    # Load data
+    data = load_sample_data()
+    
+    # Run MOEA/D for scenario without IoT
+    print("\nRunning MOEA/D for scenario without IoT...")
+    pop_without_iot = moead(n_divisions=5, n_gen=50, T=10, use_iot=False, data=data)
+    
+    # Run MOEA/D for scenario with IoT
+    print("\nRunning MOEA/D for scenario with IoT...")
+    pop_with_iot = moead(n_divisions=5, n_gen=50, T=10, use_iot=True, data=data)
+    
+    # Plot results
+    plot_pareto_front(pop_without_iot, pop_with_iot)
+    
+    # Analyze solutions
+    analyze_solutions(pop_without_iot, pop_with_iot, data)
+
+if __name__ == "__main__":
+    main()
+
+3.	MODA/D Result Python Code
+
+running MOEA/D for scenario without IoT...
+Generated 21 weight vectors
+Generation 0/50
+Generation 10/50
+Generation 20/50
+Generation 30/50
+Generation 40/50
+
+Running MOEA/D for scenario with IoT...
+Generated 21 weight vectors
+Generation 0/50
+Generation 10/50
+Generation 20/50
+Generation 30/50
+Generation 40/50
+
+Best Solutions Without IoT:
+---------------------------
+Best Cost Solution: [0.3473600148278761, 0.011239928727460977, 0.8796395786935679, 0.9441077475130084, 0.0438758921982297]
+  Cost: 94101.59
+  Emissions: 25129.62
+  Acceptance: 2055.79
+
+Best Emissions Solution: [0.9072022006140326, 0.09279779938596744, 0.932852413659949, 0.5556454047784526, 0.6552045724411674]
+  Cost: 111408.82
+  Emissions: 18244.48
+  Acceptance: 5911.27
+
+Best Acceptance Solution: [0.3306355265745298, 0.11608784417370188, 0.8490136533218031, 0.9445041299101348, 0.039582362218856346]
+  Cost: 95115.89
+  Emissions: 24327.03
+  Acceptance: 1945.37
+
+Best Solutions With IoT:
+-----------------------
+Best Cost Solution: [0.3449996641670247, 0.14157021124745992, 0.7479511975968938, 0.7792540143014112, 0.3981427616686161]
+  Cost: 115365.70
+  Emissions: 27498.28
+  Acceptance: 2429.30
+
+Best Emissions Solution: [0.9439535090596147, 0.056046490940385274, 0.7655786320665579, 0.9304480708844891, 0.3256580404374104]
+  Cost: 122588.68
+  Emissions: 22068.05
+  Acceptance: 6598.79
+
+Best Acceptance Solution: [0.3177823008512438, 0.3169808956950594, 0.7287312395960841, 0.8496563634593131, 0.32311312574405504]
+  Cost: 115951.68
+  Emissions: 26327.44
+  Acceptance: 2206.48
+
+Improvements with IoT:
+---------------------
+Cost Improvement: -22.60%
+Emissions Improvement: -20.96%
+Acceptance Improvement: 13.42%
+
+NSGA-II
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Apr  1 17:32:28 2025
+
+@author: mahsamostafaeinejad
+"""
+
+"""
+Simplified NSGA-II Implementation for EV Battery Refurbishment Optimization
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import random
+from mpl_toolkits.mplot3d import Axes3D
+
+# === SIMULATION DATA ===
+
+def load_sample_data():
+    """Provides sample data for the EV battery refurbishment model"""
+    data = {
+        "cost": {
+            'manufacturing_base_cost': 50000,
+            'manufacturing_automation_factor': 0.2,
+            'refurbishment_unit_cost': 30000,
+            'recycling_unit_cost': 20000,
+            'disposal_unit_cost': 10000,
+            'transportation_base_cost': 100.0,
+            'transportation_efficiency_factor': 0.3,
+            'transportation_iot_factor': 0.85,
+            'iot_implementation': 20000.0,
+            'iot_maintenance_factor': 0.15
+        },
+        "emissions": {
+            'manufacturing_base_emissions': 10000,
+            'manufacturing_automation_factor': 0.15,
+            'refurbishment_unit_emissions': 3000,
+            'recycling_unit_emissions': 5000,
+            'disposal_unit_emissions': 15000,
+            'transportation_base_emissions': 15.0,
+            'transportation_efficiency_factor': 0.25,
+            'transportation_iot_factor': 0.80,
+            'iot_implementation': 5000.0,
+            'iot_operation_factor': 0.1
+        },
+        "acceptance": {
+            'base_acceptance_factor': 5000,
+            'quality_automation_factor': 0.2,
+            'trust_collection_factor': 0.15,
+            'lambda_pso': 1.3,
+            'sigma_epso': 1.2,
+        }
+    }
+    return data
+
+# === OBJECTIVE FUNCTIONS ===
+
+def cost_objective(x, use_iot, data):
+    """Calculate the cost objective value"""
+    refurbish_prop, recycle_prop, automation, transport_eff, collection_rate = x
+    
+    manufacturing_cost = data['cost']['manufacturing_base_cost'] * (1 - data['cost']['manufacturing_automation_factor'] * automation)
+    refurbishment_cost = data['cost']['refurbishment_unit_cost'] * refurbish_prop
+    recycling_cost = data['cost']['recycling_unit_cost'] * recycle_prop
+    disposal_cost = data['cost']['disposal_unit_cost'] * (1 - refurbish_prop - recycle_prop)
+    transport_cost = data['cost']['transportation_base_cost'] * 500 * (1 - data['cost']['transportation_efficiency_factor'] * transport_eff)
+    
+    if use_iot:
+        iot_cost = data['cost']['iot_implementation'] + data['cost']['iot_implementation'] * data['cost']['iot_maintenance_factor']
+        transport_cost *= data['cost']['transportation_iot_factor']
+        refurbishment_cost *= 0.9
+        total_cost = manufacturing_cost + refurbishment_cost + recycling_cost + disposal_cost + transport_cost + iot_cost
+    else:
+        total_cost = manufacturing_cost + refurbishment_cost + recycling_cost + disposal_cost + transport_cost
+    
+    return total_cost
+
+def emissions_objective(x, use_iot, data):
+    """Calculate the emissions objective value"""
+    refurbish_prop, recycle_prop, automation, transport_eff, collection_rate = x
+    
+    manufacturing_emissions = data['emissions']['manufacturing_base_emissions'] * (1 - data['emissions']['manufacturing_automation_factor'] * automation)
+    refurbishment_emissions = data['emissions']['refurbishment_unit_emissions'] * refurbish_prop
+    recycling_emissions = data['emissions']['recycling_unit_emissions'] * recycle_prop
+    disposal_emissions = data['emissions']['disposal_unit_emissions'] * (1 - refurbish_prop - recycle_prop)
+    transport_emissions = data['emissions']['transportation_base_emissions'] * 500 * (1 - data['emissions']['transportation_efficiency_factor'] * transport_eff)
+    
+    if use_iot:
+        iot_emissions = data['emissions']['iot_implementation'] + data['emissions']['iot_implementation'] * data['emissions']['iot_operation_factor']
+        transport_emissions *= data['emissions']['transportation_iot_factor']
+        disposal_emissions *= 0.85
+        total_emissions = manufacturing_emissions + refurbishment_emissions + recycling_emissions + disposal_emissions + transport_emissions + iot_emissions
+    else:
+        total_emissions = manufacturing_emissions + refurbishment_emissions + recycling_emissions + disposal_emissions + transport_emissions
+    
+    return total_emissions
+
+def acceptance_objective(x, use_iot, data):
+    """Calculate the acceptance objective value (to be maximized)"""
+    refurbish_prop, recycle_prop, automation, transport_eff, collection_rate = x
+    
+    base_acceptance = data['acceptance']['base_acceptance_factor'] * refurbish_prop
+    quality_factor = 1.0 + data['acceptance']['quality_automation_factor'] * automation
+    trust_factor = 1.0 + data['acceptance']['trust_collection_factor'] * collection_rate
+    
+    if use_iot:
+        lambda_pso = data['acceptance']['lambda_pso']
+        sigma_epso = data['acceptance']['sigma_epso']
+        acceptance = base_acceptance * quality_factor * trust_factor * (1 + lambda_pso * sigma_epso * 0.1)
+    else:
+        acceptance = base_acceptance * quality_factor * trust_factor
+    
+    return acceptance
+
+def evaluate_solution(x, use_iot, data):
+    """Evaluate a solution for all three objectives"""
+    cost = cost_objective(x, use_iot, data)
+    emissions = emissions_objective(x, use_iot, data)
+    acceptance = acceptance_objective(x, use_iot, data)
+    return [cost, emissions, -acceptance]  # Negate acceptance for minimization
+
+def check_constraints(x):
+    """Check if a solution satisfies all constraints"""
+    refurbish_prop, recycle_prop, automation, transport_eff, collection_rate = x
+    
+    if refurbish_prop + recycle_prop > 1:
+        return False
+    if any(var < 0 or var > 1 for var in x):
+        return False
+    if refurbish_prop < 0.3:
+        return False
+    
+    return True
+
+# === NSGA-II ALGORITHM ===
+
+class Individual:
+    def __init__(self, genes, use_iot, data):
+        self.genes = genes.copy()
+        self.fitness = evaluate_solution(genes, use_iot, data)
+        self.rank = 0
+        self.crowding_distance = 0
+        self.dominated_count = 0
+        self.dominated_solutions = []
+        
+def create_random_individual(use_iot, data):
+    while True:
+        refurbish_prop = random.uniform(0.3, 1.0)
+        recycle_prop = random.uniform(0.0, min(0.7, 1.0 - refurbish_prop))
+        automation = random.uniform(0.0, 1.0)
+        transport_eff = random.uniform(0.0, 1.0)
+        collection_rate = random.uniform(0.0, 1.0)
+        
+        genes = [refurbish_prop, recycle_prop, automation, transport_eff, collection_rate]
+        
+        if check_constraints(genes):
+            return Individual(genes, use_iot, data)
+
+def initialize_population(pop_size, use_iot, data):
+    return [create_random_individual(use_iot, data) for _ in range(pop_size)]
+
+def dominates(p, q):
+    """Check if individual p dominates individual q"""
+    better_in_at_least_one = False
+    for i in range(len(p.fitness)):
+        if p.fitness[i] > q.fitness[i]:  # Assuming minimization
+            return False
+        elif p.fitness[i] < q.fitness[i]:
+            better_in_at_least_one = True
+    
+    return better_in_at_least_one
+
+def fast_non_dominated_sort(population):
+    """Sort population into non-dominated fronts"""
+    fronts = [[]]
+    
+    for p in population:
+        p.dominated_solutions = []
+        p.dominated_count = 0
+        
+        for q in population:
+            if p != q:  # Don't compare with self
+                if dominates(p, q):
+                    p.dominated_solutions.append(q)
+                elif dominates(q, p):
+                    p.dominated_count += 1
+        
+        if p.dominated_count == 0:
+            p.rank = 0
+            fronts[0].append(p)
+    
+    i = 0
+    while fronts[i]:
+        next_front = []
+        for p in fronts[i]:
+            for q in p.dominated_solutions:
+                q.dominated_count -= 1
+                if q.dominated_count == 0:
+                    q.rank = i + 1
+                    next_front.append(q)
+        i += 1
+        fronts.append(next_front)
+    
+    return fronts[:-1]  # Remove the last empty front
+
+def calculate_crowding_distance(front):
+    """Calculate crowding distance for individuals in a front"""
+    if len(front) <= 2:
+        for ind in front:
+            ind.crowding_distance = float('inf')
+        return
+    
+    # Initialize distances
+    for ind in front:
+        ind.crowding_distance = 0
+    
+    # Calculate crowding distance for each objective
+    for obj in range(len(front[0].fitness)):
+        # Sort by the objective
+        front.sort(key=lambda x: x.fitness[obj])
+        
+        # Boundary points have infinite distance
+        front[0].crowding_distance = float('inf')
+        front[-1].crowding_distance = float('inf')
+        
+        # Calculate for middle points
+        obj_range = front[-1].fitness[obj] - front[0].fitness[obj]
+        if obj_range == 0:
+            continue
+            
+        for i in range(1, len(front) - 1):
+            front[i].crowding_distance += (front[i+1].fitness[obj] - front[i-1].fitness[obj]) / obj_range
+
+def crowded_comparison(a, b):
+    """Crowded comparison operator for tournament selection"""
+    if a.rank < b.rank:
+        return a
+    elif a.rank > b.rank:
+        return b
+    elif a.crowding_distance > b.crowding_distance:
+        return a
+    else:
+        return b
+
+def tournament_selection(population, size=2):
+    """Tournament selection based on rank and crowding distance"""
+    participants = random.sample(population, size)
+    best = participants[0]
+    
+    for participant in participants[1:]:
+        best = crowded_comparison(best, participant)
+    
+    return best
+
+def simulated_binary_crossover(parent1, parent2, eta=20):
+    """Simulated Binary Crossover operator"""
+    child1 = parent1.genes.copy()
+    child2 = parent2.genes.copy()
+    
+    if random.random() < 0.9:  # Crossover probability
+        for i in range(len(child1)):
+            if random.random() < 0.5:  # Gene crossover probability
+                if abs(parent1.genes[i] - parent2.genes[i]) > 1e-10:
+                    if parent1.genes[i] < parent2.genes[i]:
+                        y1, y2 = parent1.genes[i], parent2.genes[i]
+                    else:
+                        y1, y2 = parent2.genes[i], parent1.genes[i]
+                    
+                    beta = 1.0 + 2.0 * (y1 - 0) / (y2 - y1)
+                    alpha = 2.0 - beta ** (-(eta + 1))
+                    
+                    rand = random.random()
+                    if rand <= 1.0 / alpha:
+                        beta_q = (rand * alpha) ** (1.0 / (eta + 1))
+                    else:
+                        beta_q = (1.0 / (2.0 - rand * alpha)) ** (1.0 / (eta + 1))
+                    
+                    c1 = 0.5 * ((y1 + y2) - beta_q * (y2 - y1))
+                    c2 = 0.5 * ((y1 + y2) + beta_q * (y2 - y1))
+                    
+                    # Ensure bounds
+                    c1 = max(0, min(1, c1))
+                    c2 = max(0, min(1, c2))
+                    
+                    child1[i] = c1
+                    child2[i] = c2
+    
+    # Ensure constraints are met
+    child1[0] = max(0.3, child1[0])
+    child2[0] = max(0.3, child2[0])
+    
+    if child1[0] + child1[1] > 1:
+        child1[1] = max(0, 1 - child1[0])
+    if child2[0] + child2[1] > 1:
+        child2[1] = max(0, 1 - child2[0])
+    
+    return child1, child2
+
+def polynomial_mutation(genes, eta=20, mutation_rate=0.2):
+    """Polynomial mutation operator"""
+    for i in range(len(genes)):
+        if random.random() < mutation_rate:
+            y = genes[i]
+            lb = 0  # Lower bound
+            ub = 1  # Upper bound
+            
+            delta1 = (y - lb) / (ub - lb)
+            delta2 = (ub - y) / (ub - lb)
+            
+            mut_pow = 1.0 / (eta + 1.0)
+            rand = random.random()
+            
+            if rand < 0.5:
+                xy = 1.0 - delta1
+                val = 2.0 * rand + (1.0 - 2.0 * rand) * (xy ** (eta + 1))
+                delta_q = 1.0 - (val ** mut_pow)
+            else:
+                xy = 1.0 - delta2
+                val = 2.0 * (1.0 - rand) + 2.0 * (rand - 0.5) * (xy ** (eta + 1))
+                delta_q = 1.0 - (val ** mut_pow)
+            
+            y = y + delta_q * (ub - lb)
+            y = max(lb, min(ub, y))
+            genes[i] = y
+    
+    # Ensure constraints are met
+    genes[0] = max(0.3, genes[0])  # Minimum refurbishment proportion
+    
+    if genes[0] + genes[1] > 1:
+        genes[1] = max(0, 1 - genes[0])
+        
+    return genes
+
+def nsga2(pop_size, generations, use_iot, data):
+    """NSGA-II main algorithm"""
+    # Initialize population
+    population = initialize_population(pop_size, use_iot, data)
+    
+    # Main loop
+    for gen in range(generations):
+        print(f"Generation {gen+1}/{generations}")
+        
+        # Create offspring through selection, crossover, and mutation
+        offspring = []
+        
+        while len(offspring) < pop_size:
+            # Tournament selection
+            parent1 = tournament_selection(population)
+            parent2 = tournament_selection(population)
+            
+            # Crossover
+            child1_genes, child2_genes = simulated_binary_crossover(parent1, parent2)
+            
+            # Mutation
+            child1_genes = polynomial_mutation(child1_genes)
+            child2_genes = polynomial_mutation(child2_genes)
+            
+            # Create new individuals
+            child1 = Individual(child1_genes, use_iot, data)
+            child2 = Individual(child2_genes, use_iot, data)
+            
+            offspring.extend([child1, child2])
+        
+        # Keep population size consistent
+        if len(offspring) > pop_size:
+            offspring = offspring[:pop_size]
+        
+        # Combine parent and offspring populations
+        combined_pop = population + offspring
+        
+        # Fast non-dominated sort
+        fronts = fast_non_dominated_sort(combined_pop)
+        
+        # Select the next generation population
+        next_population = []
+        front_index = 0
+        
+        # Add complete fronts as long as they fit
+        while len(next_population) + len(fronts[front_index]) <= pop_size:
+            calculate_crowding_distance(fronts[front_index])
+            next_population.extend(fronts[front_index])
+            front_index += 1
+            if front_index >= len(fronts):
+                break
+        
+        # If needed, add individuals from the next front based on crowding distance
+        if len(next_population) < pop_size and front_index < len(fronts):
+            calculate_crowding_distance(fronts[front_index])
+            sorted_front = sorted(fronts[front_index], 
+                                 key=lambda x: x.crowding_distance, 
+                                 reverse=True)
+            
+            next_population.extend(sorted_front[:pop_size - len(next_population)])
+        
+        # Update population
+        population = next_population
+    
+    return population
+
+# === PLOTTING AND ANALYSIS ===
+
+def plot_results(population_without_iot, population_with_iot):
+    """Plot comparison of Pareto fronts with and without IoT"""
+    # Extract fitness values
+    cost_without_iot = [ind.fitness[0] for ind in population_without_iot]
+    emissions_without_iot = [ind.fitness[1] for ind in population_without_iot]
+    acceptance_without_iot = [-ind.fitness[2] for ind in population_without_iot]
+    
+    cost_with_iot = [ind.fitness[0] for ind in population_with_iot]
+    emissions_with_iot = [ind.fitness[1] for ind in population_with_iot]
+    acceptance_with_iot = [-ind.fitness[2] for ind in population_with_iot]
+    
+    # 2D plots
+    plt.figure(figsize=(15, 5))
+    
+    # Cost vs Emissions
+    plt.subplot(1, 3, 1)
+    plt.scatter(cost_without_iot, emissions_without_iot, color='blue', label='Without IoT')
+    plt.scatter(cost_with_iot, emissions_with_iot, color='red', label='With IoT')
+    plt.xlabel('Cost')
+    plt.ylabel('Emissions')
+    plt.title('Cost vs. Emissions')
+    plt.legend()
+    plt.grid(True)
+    
+    # Cost vs Acceptance
+    plt.subplot(1, 3, 2)
+    plt.scatter(cost_without_iot, acceptance_without_iot, color='blue', label='Without IoT')
+    plt.scatter(cost_with_iot, acceptance_with_iot, color='red', label='With IoT')
+    plt.xlabel('Cost')
+    plt.ylabel('Acceptance')
+    plt.title('Cost vs. Acceptance')
+    plt.legend()
+    plt.grid(True)
+    
+    # Emissions vs Acceptance
+    plt.subplot(1, 3, 3)
+    plt.scatter(emissions_without_iot, acceptance_without_iot, color='blue', label='Without IoT')
+    plt.scatter(emissions_with_iot, acceptance_with_iot, color='red', label='With IoT')
+    plt.xlabel('Emissions')
+    plt.ylabel('Acceptance')
+    plt.title('Emissions vs. Acceptance')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('pareto_comparison_2d.png')
+    plt.show()
+    
+    # 3D plot
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Plot the points
+    ax.scatter(cost_without_iot, emissions_without_iot, acceptance_without_iot, 
+               color='blue', label='Without IoT')
+    ax.scatter(cost_with_iot, emissions_with_iot, acceptance_with_iot, 
+               color='red', label='With IoT')
+    
+    ax.set_xlabel('Cost')
+    ax.set_ylabel('Emissions')
+    ax.set_zlabel('Acceptance')
+    ax.set_title('3D Pareto Front Comparison')
+    
+    plt.legend()
+    plt.savefig('pareto_comparison_3d.png')
+    plt.show()
+
+def analyze_results(population_without_iot, population_with_iot, data):
+    """Analyze the results of optimization"""
+    # Find best solutions for each objective
+    min_cost_without_iot = min(population_without_iot, key=lambda x: x.fitness[0])
+    min_emissions_without_iot = min(population_without_iot, key=lambda x: x.fitness[1])
+    max_acceptance_without_iot = min(population_without_iot, key=lambda x: x.fitness[2])  # Remember it's negated
+    
+    min_cost_with_iot = min(population_with_iot, key=lambda x: x.fitness[0])
+    min_emissions_with_iot = min(population_with_iot, key=lambda x: x.fitness[1])
+    max_acceptance_with_iot = min(population_with_iot, key=lambda x: x.fitness[2])  # Remember it's negated
+    
+    # Print results
+    print("\nBest Solutions Without IoT:")
+    print(f"Best Cost Solution: {min_cost_without_iot.genes}")
+    print(f"  Cost: {min_cost_without_iot.fitness[0]:.2f}, Emissions: {min_cost_without_iot.fitness[1]:.2f}, " +
+          f"Acceptance: {-min_cost_without_iot.fitness[2]:.2f}")
+    
+    print(f"Best Emissions Solution: {min_emissions_without_iot.genes}")
+    print(f"  Cost: {min_emissions_without_iot.fitness[0]:.2f}, Emissions: {min_emissions_without_iot.fitness[1]:.2f}, " +
+          f"Acceptance: {-min_emissions_without_iot.fitness[2]:.2f}")
+    
+    print(f"Best Acceptance Solution: {max_acceptance_without_iot.genes}")
+    print(f"  Cost: {max_acceptance_without_iot.fitness[0]:.2f}, Emissions: {max_acceptance_without_iot.fitness[1]:.2f}, " +
+          f"Acceptance: {-max_acceptance_without_iot.fitness[2]:.2f}")
+    
+    print("\nBest Solutions With IoT:")
+    print(f"Best Cost Solution: {min_cost_with_iot.genes}")
+    print(f"  Cost: {min_cost_with_iot.fitness[0]:.2f}, Emissions: {min_cost_with_iot.fitness[1]:.2f}, " +
+          f"Acceptance: {-min_cost_with_iot.fitness[2]:.2f}")
+    
+    print(f"Best Emissions Solution: {min_emissions_with_iot.genes}")
+    print(f"  Cost: {min_emissions_with_iot.fitness[0]:.2f}, Emissions: {min_emissions_with_iot.fitness[1]:.2f}, " +
+          f"Acceptance: {-min_emissions_with_iot.fitness[2]:.2f}")
+    
+    print(f"Best Acceptance Solution: {max_acceptance_with_iot.genes}")
+    print(f"  Cost: {max_acceptance_with_iot.fitness[0]:.2f}, Emissions: {max_acceptance_with_iot.fitness[1]:.2f}, " +
+          f"Acceptance: {-max_acceptance_with_iot.fitness[2]:.2f}")
+    
+    # Improvement comparison
+    cost_improvement = (min_cost_without_iot.fitness[0] - min_cost_with_iot.fitness[0]) / min_cost_without_iot.fitness[0] * 100
+    emissions_improvement = (min_emissions_without_iot.fitness[1] - min_emissions_with_iot.fitness[1]) / min_emissions_without_iot.fitness[1] * 100
+    acceptance_improvement = (-max_acceptance_with_iot.fitness[2] - (-max_acceptance_without_iot.fitness[2])) / (-max_acceptance_without_iot.fitness[2]) * 100
+    
+    print("\nImprovements with IoT:")
+    print(f"Cost: {cost_improvement:.2f}%")
+    print(f"Emissions: {emissions_improvement:.2f}%")
+    print(f"Acceptance: {acceptance_improvement:.2f}%")
+
+def main():
+    # Set random seed for reproducibility
+    random.seed(42)
+    np.random.seed(42)
+    
+    # Load data
+    data = load_sample_data()
+    
+    # Set optimization parameters
+    pop_size = 50  # Smaller population for faster execution
+    generations = 20  # Fewer generations for faster execution
+    
+    # Run NSGA-II for scenario without IoT
+    print("\nRunning NSGA-II for scenario without IoT...")
+    population_without_iot = nsga2(pop_size, generations, use_iot=False, data=data)
+    
+    # Run NSGA-II for scenario with IoT
+    print("\nRunning NSGA-II for scenario with IoT...")
+    population_with_iot = nsga2(pop_size, generations, use_iot=True, data=data)
+    
+    # Plot and analyze results
+    plot_results(population_without_iot, population_with_iot)
+    analyze_results(population_without_iot, population_with_iot, data)
+
+if __name__ == "__main__":
+    main()
+
+4.	 NSGA-II Result pYTHON CODE
+Running NSGA-II for scenario without IoT...
+Generation 1/20
+Generation 2/20
+Generation 3/20
+Generation 4/20
+Generation 5/20
+Generation 6/20
+Generation 7/20
+Generation 8/20
+Generation 9/20
+Generation 10/20
+Generation 11/20
+Generation 12/20
+Generation 13/20
+Generation 14/20
+Generation 15/20
+Generation 16/20
+Generation 17/20
+Generation 18/20
+Generation 19/20
+Generation 20/20
+
+Running NSGA-II for scenario with IoT...
+Generation 1/20
+Generation 2/20
+Generation 3/20
+Generation 4/20
+Generation 5/20
+Generation 6/20
+Generation 7/20
+Generation 8/20
+Generation 9/20
+Generation 10/20
+Generation 11/20
+Generation 12/20
+Generation 13/20
+Generation 14/20
+Generation 15/20
+Generation 16/20
+Generation 17/20
+Generation 18/20
+Generation 19/20
+Generation 20/20
+
+ 
+Important
+Figures are displayed in the Plots pane by default. To make them also appear inline in the console, you need to uncheck "Mute inline plotting" under the options menu of Plots.
+ 
+Best Solutions Without IoT:
+Best Cost Solution: [0.3, 7.437616984476784e-05, 1, 1, 1]
+  Cost: 91000.74, Emissions: 25524.26, Acceptance: 2070.00
+Best Emissions Solution: [1, 0, 1, 1, 1]
+  Cost: 105000.00, Emissions: 17125.00, Acceptance: 6900.00
+Best Acceptance Solution: [1, 0, 1, 1, 1]
+  Cost: 105000.00, Emissions: 17125.00, Acceptance: 6900.00
+
+Best Solutions With IoT:
+Best Cost Solution: [0.5764287315773106, 0.025498061134538327, 1, 0.9996601830272408, 0.27289997338737026]
+  Cost: 112808.60, Emissions: 25432.72, Acceptance: 4161.77
+Best Emissions Solution: [1, 0, 1, 1, 1]
+  Cost: 119750.00, Emissions: 21500.00, Acceptance: 7976.40
+Best Acceptance Solution: [1, 0, 1, 1, 1]
+  Cost: 119750.00, Emissions: 21500.00, Acceptance: 7976.40
+
+Improvements with IoT:
+Cost: -23.96%
+Emissions: -25.55%
+Acceptance: 15.60%
+
+e-constraint AND weighted sum
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Apr  1 13:12:43 2025
+
+@author: mahsamostafaeinejad
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from itertools import product
+
+# Note: This code is designed to work without requiring the PuLP library
+# Instead, we'll simulate the optimization process to demonstrate the concepts
+
+# Sample data generation for the EV battery refurbishment model
+np.random.seed(42)  # For reproducibility
+
+# Define the sets (small scale for demonstration)
+I = ['S1', 'S2']  # Raw material suppliers
+J = ['M1', 'M2']  # Manufacturers
+K = ['R1', 'R2']  # Retailers
+L = ['D1', 'D2']  # Local distribution centers
+N = ['C1', 'C2']  # Collection centers
+E = ['RF1', 'RF2']  # Refurbishment centers
+F = ['RC1', 'RC2']  # Recycling centers
+G = ['DS1', 'DS2']  # Disposal sites
+P = ['B1', 'B2']  # Battery types
+T = ['T1', 'T2']  # Time periods
+V = ['V1', 'V2']  # Vehicle types
+S = ['S1', 'S2', 'S3']  # State of health categories
+R = ['R1', 'R2']  # Refurbished product types
+O = ['O1', 'O2']  # IoT technology types
+
+def generate_sample_data():
+    """Generate sample data for the model parameters"""
+    data = {}
+    
+    # Deterioration/loss rate for battery type p
+    data['alpha_p'] = {p: np.random.uniform(0.1, 0.3) for p in P}
+    
+    # IoT Specific Parameters
+    data['lambda_pso'] = {(p, s, o): np.random.uniform(1.1, 1.5) for p, s, o in product(P, S, O)}
+    data['sigma_epso'] = {(e, p, s, o): np.random.uniform(1.1, 1.4) for e, p, s, o in product(E, P, S, O)}
+    data['tau_pso'] = {(p, s, o): np.random.uniform(0.6, 0.9) for p, s, o in product(P, S, O)}
+    
+    # Quality and Performance Parameters
+    data['rho_ps'] = {(p, s): np.random.uniform(0.5, 0.9) for p, s in product(P, S)}
+    data['SoH_ps'] = {(p, s): np.random.uniform(0.4, 0.9) for p, s in product(P, S)}
+    
+    # Battery Acceptance Parameters
+    data['Accept_ps'] = {(p, s): np.random.uniform(0.5, 0.9) for p, s in product(P, S)}
+    data['Perf_ps'] = {(p, s): np.random.uniform(0.6, 0.95) for p, s in product(P, S)}
+    data['Trust_pst'] = {(p, s, t): np.random.uniform(0.5, 0.9) for p, s, t in product(P, S, T)}
+    
+    return data
+
+def simulate_results(use_iot=True, weighted_sum=True, weights=(0.7, 0.2, 0.1), epsilon=(None, None)):
+    """
+    Simulate optimization results without solving an actual LP
+    
+    Parameters:
+    use_iot: Boolean indicating whether to include IoT technology (True) or not (False)
+    weighted_sum: Boolean indicating whether to use weighted sum (True) or epsilon-constraint (False)
+    weights: Tuple of weights for the three objectives (cost, emissions, acceptance)
+    epsilon: Tuple of epsilon values for the second and third objectives (emissions, acceptance)
+    
+    Returns:
+    objective_values: Dictionary containing the simulated values of the three objectives
+    """
+    # Base values
+    base_cost = 50000
+    base_emissions = 10000
+    base_acceptance = 5000
+    
+    # IoT effect multipliers
+    iot_cost_factor = 1.2  # IoT increases costs initially due to implementation
+    iot_emissions_factor = 0.85  # IoT reduces emissions
+    iot_acceptance_factor = 1.4  # IoT improves acceptance significantly
+    
+    # Scalarization method effects
+    ws_factor = 1.05  # Weighted sum tends to be slightly less optimal for individual objectives
+    
+    # Calculate objective values
+    if use_iot:
+        cost = base_cost * iot_cost_factor
+        emissions = base_emissions * iot_emissions_factor
+        acceptance = base_acceptance * iot_acceptance_factor
+    else:
+        cost = base_cost
+        emissions = base_emissions
+        acceptance = base_acceptance
+    
+    # Apply scalarization method effects
+    if weighted_sum:
+        cost *= ws_factor
+        emissions *= ws_factor
+        acceptance *= (1/ws_factor)  # Acceptance is to be maximized
+    
+    # Add some random variation
+    cost *= np.random.uniform(0.95, 1.05)
+    emissions *= np.random.uniform(0.95, 1.05)
+    acceptance *= np.random.uniform(0.95, 1.05)
+    
+    objective_values = {
+        'cost': cost,
+        'emissions': emissions,
+        'acceptance': acceptance
+    }
+    
+    return objective_values
+
+def run_scenarios():
+    """Run the model for different scenarios and compare results"""
+    data = generate_sample_data()
+    
+    # Scenario 1: Without IoT using weighted sum
+    print("Solving Scenario 1: Without IoT using weighted sum...")
+    obj_without_iot_ws = simulate_results(
+        use_iot=False, weighted_sum=True, weights=(0.7, 0.2, 0.1)
+    )
+    
+    # Scenario 2: With IoT using weighted sum
+    print("Solving Scenario 2: With IoT using weighted sum...")
+    obj_with_iot_ws = simulate_results(
+        use_iot=True, weighted_sum=True, weights=(0.7, 0.2, 0.1)
+    )
+    
+    # Scenario 3: Without IoT using ε-constraint
+    print("Solving Scenario 3: Without IoT using ε-constraint...")
+    obj_without_iot_ec = simulate_results(
+        use_iot=False, weighted_sum=False, epsilon=(12000, -6000)
+    )
+    
+    # Scenario 4: With IoT using ε-constraint
+    print("Solving Scenario 4: With IoT using ε-constraint...")
+    obj_with_iot_ec = simulate_results(
+        use_iot=True, weighted_sum=False, epsilon=(10000, -8000)
+    )
+    
+    # Print results
+    print("\nScenario Results:")
+    print("=" * 80)
+    print(f"Without IoT (Weighted Sum): Cost = {obj_without_iot_ws['cost']:.2f}, " +
+          f"Emissions = {obj_without_iot_ws['emissions']:.2f}, " +
+          f"Acceptance = {obj_without_iot_ws['acceptance']:.2f}")
+    
+    print(f"With IoT (Weighted Sum): Cost = {obj_with_iot_ws['cost']:.2f}, " +
+          f"Emissions = {obj_with_iot_ws['emissions']:.2f}, " +
+          f"Acceptance = {obj_with_iot_ws['acceptance']:.2f}")
+    
+    print(f"Without IoT (ε-constraint): Cost = {obj_without_iot_ec['cost']:.2f}, " +
+          f"Emissions = {obj_without_iot_ec['emissions']:.2f}, " +
+          f"Acceptance = {obj_without_iot_ec['acceptance']:.2f}")
+    
+    print(f"With IoT (ε-constraint): Cost = {obj_with_iot_ec['cost']:.2f}, " +
+          f"Emissions = {obj_with_iot_ec['emissions']:.2f}, " +
+          f"Acceptance = {obj_with_iot_ec['acceptance']:.2f}")
+    
+    # Calculate improvements
+    cost_change_ws = ((obj_with_iot_ws['cost'] - obj_without_iot_ws['cost']) / 
+                     obj_without_iot_ws['cost'] * 100)
+    emissions_change_ws = ((obj_with_iot_ws['emissions'] - obj_without_iot_ws['emissions']) / 
+                          obj_without_iot_ws['emissions'] * 100)
+    acceptance_change_ws = ((obj_with_iot_ws['acceptance'] - obj_without_iot_ws['acceptance']) / 
+                           obj_without_iot_ws['acceptance'] * 100)
+    
+    cost_change_ec = ((obj_with_iot_ec['cost'] - obj_without_iot_ec['cost']) / 
+                     obj_without_iot_ec['cost'] * 100)
+    emissions_change_ec = ((obj_with_iot_ec['emissions'] - obj_without_iot_ec['emissions']) / 
+                          obj_without_iot_ec['emissions'] * 100)
+    acceptance_change_ec = ((obj_with_iot_ec['acceptance'] - obj_without_iot_ec['acceptance']) / 
+                           obj_without_iot_ec['acceptance'] * 100)
+    
+    print("\nImpact of IoT Implementation:")
+    print("=" * 80)
+    print(f"Weighted Sum Method: Cost {cost_change_ws:.2f}%, " +
+          f"Emissions {emissions_change_ws:.2f}%, " +
+          f"Acceptance {acceptance_change_ws:.2f}%")
+    
+    print(f"ε-constraint Method: Cost {cost_change_ec:.2f}%, " +
+          f"Emissions {emissions_change_ec:.2f}%, " +
+          f"Acceptance {acceptance_change_ec:.2f}%")
+    
+    # Create visualizations
+    plot_results(obj_without_iot_ws, obj_with_iot_ws, 
+                obj_without_iot_ec, obj_with_iot_ec)
+    
+    return {
+        'without_iot_ws': obj_without_iot_ws,
+        'with_iot_ws': obj_with_iot_ws,
+        'without_iot_ec': obj_without_iot_ec,
+        'with_iot_ec': obj_with_iot_ec
+    }
+
+def plot_results(obj_without_iot_ws, obj_with_iot_ws, obj_without_iot_ec, obj_with_iot_ec):
+    """Create visualizations comparing the different scenarios"""
+    
+    # Extract data for plotting
+    scenarios = ['Without IoT (WS)', 'With IoT (WS)', 'Without IoT (EC)', 'With IoT (EC)']
+    cost_values = [obj_without_iot_ws['cost'], obj_with_iot_ws['cost'],
+                  obj_without_iot_ec['cost'], obj_with_iot_ec['cost']]
+    emissions_values = [obj_without_iot_ws['emissions'], obj_with_iot_ws['emissions'],
+                       obj_without_iot_ec['emissions'], obj_with_iot_ec['emissions']]
+    acceptance_values = [obj_without_iot_ws['acceptance'], obj_with_iot_ws['acceptance'],
+                        obj_without_iot_ec['acceptance'], obj_with_iot_ec['acceptance']]
+    
+    # Create a figure with subplots
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    
+    # Plot cost
+    axes[0].bar(scenarios, cost_values, color=['#1f77b4', '#ff7f0e', '#1f77b4', '#ff7f0e'])
+    axes[0].set_title('Total Cost')
+    axes[0].set_ylabel('Cost Units')
+    axes[0].tick_params(axis='x', rotation=45)
+    axes[0].grid(axis='y', linestyle='--', alpha=0.7)
+    
+    # Plot emissions
+    axes[1].bar(scenarios, emissions_values, color=['#1f77b4', '#ff7f0e', '#1f77b4', '#ff7f0e'])
+    axes[1].set_title('GHG Emissions')
+    axes[1].set_ylabel('Emission Units')
+    axes[1].tick_params(axis='x', rotation=45)
+    axes[1].grid(axis='y', linestyle='--', alpha=0.7)
+    
+    # Plot acceptance
+    axes[2].bar(scenarios, acceptance_values, color=['#1f77b4', '#ff7f0e', '#1f77b4', '#ff7f0e'])
+    axes[2].set_title('Battery Acceptance')
+    axes[2].set_ylabel('Acceptance Units')
+    axes[2].tick_params(axis='x', rotation=45)
+    axes[2].grid(axis='y', linestyle='--', alpha=0.7)
+    
+    # Adjust layout
+    plt.tight_layout()
+    plt.savefig('ev_battery_results.png')
+    plt.close()
+    
+    # Create a radar chart for multi-objective comparison
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, polar=True)
+    
+    # Normalize values for radar chart
+    max_cost = max(cost_values)
+    max_emissions = max(emissions_values)
+    max_acceptance = max(acceptance_values)
+    
+    # Convert to list where higher is better for all metrics
+    normalized_values = [
+        [1 - (obj_without_iot_ws['cost'] / max_cost), 
+         1 - (obj_without_iot_ws['emissions'] / max_emissions),
+         obj_without_iot_ws['acceptance'] / max_acceptance],
+        [1 - (obj_with_iot_ws['cost'] / max_cost), 
+         1 - (obj_with_iot_ws['emissions'] / max_emissions),
+         obj_with_iot_ws['acceptance'] / max_acceptance],
+        [1 - (obj_without_iot_ec['cost'] / max_cost), 
+         1 - (obj_without_iot_ec['emissions'] / max_emissions),
+         obj_without_iot_ec['acceptance'] / max_acceptance],
+        [1 - (obj_with_iot_ec['cost'] / max_cost), 
+         1 - (obj_with_iot_ec['emissions'] / max_emissions),
+         obj_with_iot_ec['acceptance'] / max_acceptance]
+    ]
+    
+    # Number of variables
+    categories = ['Cost\nEfficiency', 'Emissions\nReduction', 'Acceptance']
+    N = len(categories)
+    
+    # We need to repeat the first value to close the circle
+    angles = [n / float(N) * 2 * np.pi for n in range(N)]
+    angles += angles[:1]
+    
+    # Labels on plot
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(categories)
+    
+    # Draw the chart
+    for i, scenario in enumerate(scenarios):
+        values = normalized_values[i]
+        values += values[:1]  # Repeat the first value to close the circle
+        ax.plot(angles, values, linewidth=2, linestyle='solid', label=scenario)
+        ax.fill(angles, values, alpha=0.1)
+    
+    # Add legend
+    plt.legend(loc='upper right', bbox_to_anchor=(0.1, 0.1))
+    plt.title('Multi-Objective Comparison (Higher is Better)')
+    
+    plt.savefig('ev_battery_radar.png')
+    plt.close()
+    
+    print("Visualizations have been saved as 'ev_battery_results.png' and 'ev_battery_radar.png'")
+
+def apply_weighted_sum_method(data, use_iot=True, weights=(0.7, 0.2, 0.1)):
+    """
+    Demonstrate the weighted sum method for multi-objective optimization
+    
+    Parameters:
+    data: Dictionary containing all parameter values
+    use_iot: Boolean indicating whether to include IoT technology
+    weights: Tuple of weights for the three objectives (cost, emissions, acceptance)
+    
+    Returns:
+    Dictionary containing simulated objective values and combined objective
+    """
+    print(f"\nApplying Weighted Sum Method (IoT: {'Yes' if use_iot else 'No'})")
+    print(f"Weights: Cost = {weights[0]}, Emissions = {weights[1]}, Acceptance = {weights[2]}")
+    
+    # Simulate individual objective values
+    obj_values = simulate_results(use_iot=use_iot, weighted_sum=True, weights=weights)
+    
+    # Calculate combined objective (note: acceptance is negated for minimization)
+    combined_obj = (weights[0] * obj_values['cost'] + 
+                   weights[1] * obj_values['emissions'] - 
+                   weights[2] * obj_values['acceptance'])
+    
+    print(f"Cost: {obj_values['cost']:.2f}")
+    print(f"Emissions: {obj_values['emissions']:.2f}")
+    print(f"Acceptance: {obj_values['acceptance']:.2f}")
+    print(f"Combined Objective: {combined_obj:.2f}")
+    
+    return {'individual': obj_values, 'combined': combined_obj}
+
+def apply_epsilon_constraint_method(data, use_iot=True, primary_obj='cost', 
+                                  emission_bound=None, acceptance_bound=None):
+    """
+    Demonstrate the ε-constraint method for multi-objective optimization
+    
+    Parameters:
+    data: Dictionary containing all parameter values
+    use_iot: Boolean indicating whether to include IoT technology
+    primary_obj: The primary objective to minimize ('cost', 'emissions', or 'acceptance')
+    emission_bound: Upper bound for emissions (ε value)
+    acceptance_bound: Lower bound for acceptance (negative ε value for minimization problem)
+    
+    Returns:
+    Dictionary containing simulated objective values
+    """
+    print(f"\nApplying ε-constraint Method (IoT: {'Yes' if use_iot else 'No'})")
+    print(f"Primary Objective: {primary_obj}")
+    if emission_bound is not None:
+        print(f"Emission Bound (ε): {emission_bound}")
+    if acceptance_bound is not None:
+        print(f"Acceptance Bound (ε): {acceptance_bound}")
+    
+    # Simulate objective values
+    obj_values = simulate_results(use_iot=use_iot, weighted_sum=False, 
+                                epsilon=(emission_bound, acceptance_bound))
+    
+    # Check if constraints are satisfied
+    constraints_satisfied = True
+    if emission_bound is not None and obj_values['emissions'] > emission_bound:
+        constraints_satisfied = False
+        print(f"Warning: Emissions constraint violated ({obj_values['emissions']:.2f} > {emission_bound})")
+    
+    if acceptance_bound is not None and -obj_values['acceptance'] > acceptance_bound:
+        constraints_satisfied = False
+        print(f"Warning: Acceptance constraint violated ({-obj_values['acceptance']:.2f} > {acceptance_bound})")
+    
+    print(f"Cost: {obj_values['cost']:.2f}")
+    print(f"Emissions: {obj_values['emissions']:.2f}")
+    print(f"Acceptance: {obj_values['acceptance']:.2f}")
+    print(f"Constraints Satisfied: {'Yes' if constraints_satisfied else 'No'}")
+    
+    return {'values': obj_values, 'feasible': constraints_satisfied}
+
+def main():
+    """Main function to demonstrate the model and scalarization methods"""
+    print("EV Battery Refurbishment Model with IoT Integration")
+    print("=" * 80)
+    
+    # Generate sample data
+    data = generate_sample_data()
+    
+    print("\nDemonstrating different scenarios and scalarization methods:")
+    
+    # Run all scenarios and plot results
+    results = run_scenarios()
+    
+    # Show example of weighted sum method in detail
+    print("\nDemonstrating Weighted Sum Method in Detail:")
+    ws_without_iot = apply_weighted_sum_method(data, use_iot=False, weights=(0.7, 0.2, 0.1))
+    ws_with_iot = apply_weighted_sum_method(data, use_iot=True, weights=(0.7, 0.2, 0.1))
+    
+    # Compare weighted sum results
+    print("\nWeighted Sum Method Comparison:")
+    cost_change = ((ws_with_iot['individual']['cost'] - ws_without_iot['individual']['cost']) / 
+                  ws_without_iot['individual']['cost'] * 100)
+    emissions_change = ((ws_with_iot['individual']['emissions'] - ws_without_iot['individual']['emissions']) / 
+                       ws_without_iot['individual']['emissions'] * 100)
+    acceptance_change = ((ws_with_iot['individual']['acceptance'] - ws_without_iot['individual']['acceptance']) / 
+                        ws_without_iot['individual']['acceptance'] * 100)
+    combined_change = ((ws_with_iot['combined'] - ws_without_iot['combined']) / 
+                      ws_without_iot['combined'] * 100)
+    
+    print(f"IoT Impact: Cost {cost_change:.2f}%, Emissions {emissions_change:.2f}%, " +
+          f"Acceptance {acceptance_change:.2f}%, Combined {combined_change:.2f}%")
+    
+    # Show example of ε-constraint method in detail
+    print("\nDemonstrating ε-constraint Method in Detail:")
+    
+    # For without IoT scenario, use reasonable bounds
+    ec_without_iot = apply_epsilon_constraint_method(
+        data, use_iot=False, primary_obj='cost',
+        emission_bound=12000,  # Upper bound for emissions
+        acceptance_bound=-4000  # Lower bound for acceptance (note: negative since we're minimizing -acceptance)
+    )
+    
+    # For with IoT scenario, adjust bounds based on expected improvements
+    ec_with_iot = apply_epsilon_constraint_method(
+        data, use_iot=True, primary_obj='cost',
+        emission_bound=10000,  # Tighter emissions bound
+        acceptance_bound=-6000  # Higher acceptance requirement
+    )
+    
+    print("\nε-constraint Method Analysis:")
+    if ec_without_iot['feasible'] and ec_with_iot['feasible']:
+        print("Both scenarios satisfy all constraints, showing IoT enables more restrictive bounds")
+    elif ec_with_iot['feasible'] and not ec_without_iot['feasible']:
+        print("Only the IoT scenario can meet the strict environmental and acceptance constraints")
+    else:
+        print("Constraint satisfaction varies between scenarios - adjust bounds as needed")
+    
+    print("\nConclusion:")
+    print("The analysis demonstrates that incorporating IoT technology in EV battery refurbishment")
+    print("generally increases upfront costs but leads to benefits in emissions reduction and")
+    print("significantly higher acceptance rates for refurbished batteries.")
+
+if __name__ == "__main__":
+main()
+5.	Weighted sum and e-constraint Result Python Code
+Demonstrating different scenarios and scalarization methods:
+Solving Scenario 1: Without IoT using weighted sum...
+Solving Scenario 2: With IoT using weighted sum...
+Solving Scenario 3: Without IoT using ε-constraint...
+Solving Scenario 4: With IoT using ε-constraint...
+
+Scenario Results:
+================================================================================
+Without IoT (Weighted Sum): Cost = 52563.49, Emissions = 10212.82, Acceptance = 4831.03
+With IoT (Weighted Sum): Cost = 60948.51, Emissions = 9095.41, Acceptance = 6591.16
+Without IoT (ε-constraint): Cost = 52183.65, Emissions = 9637.52, Acceptance = 4920.53
+With IoT (ε-constraint): Cost = 57680.84, Emissions = 8860.99, Acceptance = 7264.14
+
+Impact of IoT Implementation:
+================================================================================
+Weighted Sum Method: Cost 15.95%, Emissions -10.94%, Acceptance 36.43%
+ε-constraint Method: Cost 10.53%, Emissions -8.06%, Acceptance 47.63%
+Visualizations have been saved as 'ev_battery_results.png' and 'ev_battery_radar.png'
+
+Demonstrating Weighted Sum Method in Detail:
+
+Applying Weighted Sum Method (IoT: No)
+Weights: Cost = 0.7, Emissions = 0.2, Acceptance = 0.1
+Cost: 51229.19
+Emissions: 10667.98
+Acceptance: 4912.96
+Combined Objective: 37502.74
+
+Applying Weighted Sum Method (IoT: Yes)
+Weights: Cost = 0.7, Emissions = 0.2, Acceptance = 0.1
+Cost: 63347.77
+Emissions: 8951.46
+Acceptance: 6494.57
+Combined Objective: 45484.27
+
+Weighted Sum Method Comparison:
+IoT Impact: Cost 23.66%, Emissions -16.09%, Acceptance 32.19%, Combined 21.28%
+
+Demonstrating ε-constraint Method in Detail:
+Applying ε-constraint Method (IoT: No)
+Primary Objective: cost
+Emission Bound (ε): 12000
+Acceptance Bound (ε): -4000
+Cost: 47965.51
+Emissions: 10397.22
+Acceptance: 5200.21
+Constraints Satisfied: Yes
+
+Applying ε-constraint Method (IoT: Yes)
+Primary Objective: cost
+Emission Bound (ε): 10000
+Acceptance Bound (ε): -6000
+Cost: 60798.61
+Emissions: 8363.18
+Acceptance: 6894.45
+Constraints Satisfied: Yes
+
+ε-constraint Method Analysis:
+Both scenarios satisfy all constraints, showing IoT enables more restrictive bounds
